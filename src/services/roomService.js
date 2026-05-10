@@ -25,10 +25,7 @@ export async function loginAnonymously() {
 export async function createRoom(playerName) {
   const user = await loginAnonymously();
   const code = generateRoomCode();
-  const player = {
-    id: user.uid, name: playerName,
-    hand: [], isHost: true, isReady: false,
-  };
+  const player = { id: user.uid, name: playerName, hand: [], isHost: true, isReady: false };
   await setDoc(doc(db, "rooms", code), {
     code, status: "waiting", hostId: user.uid,
     currentTurn: null, siegeTarget: null,
@@ -118,63 +115,27 @@ export async function callFiver(roomCode, playerId) {
     currentTurn: getNextPlayerId(room.players, playerId),
   });
 }
-// ==========================================
-// CARTAS ESPECIALES
-// ==========================================
 
-// Robar carta al azar de otro jugador (simple: 1 carta, combo: 3 cartas)
+// Helper: quita N cartas de un subtipo de la mano y las devuelve
+function extractSpecialCards(hand, subtype, amount) {
+  const result = [];
+  const newHand = [...hand];
+  for (let i = 0; i < amount; i++) {
+    const idx = newHand.findIndex(c => c.subtype === subtype);
+    if (idx !== -1) result.push(...newHand.splice(idx, 1));
+  }
+  return { newHand, usedCards: result };
+}
+
 export async function playRobo(roomCode, playerId, targetId, isCombo = false) {
   const roomRef = doc(db, "rooms", roomCode);
   const roomSnap = await getDoc(roomRef);
   const room = roomSnap.data();
-
   if (room.currentTurn !== playerId) throw new Error("NO_ES_TU_TURNO");
 
   const attacker = room.players.find(p => p.id === playerId);
   const target = room.players.find(p => p.id === targetId);
   const amount = isCombo ? 3 : 1;
-
-  if (target.hand.length < amount) throw new Error("OBJETIVO_SIN_CARTAS");
-
-  // Robar cartas al azar
-  const targetHand = [...target.hand];
-  const stolen = [];
-  for (let i = 0; i < amount; i++) {
-    const idx = Math.floor(Math.random() * targetHand.length);
-    stolen.push(...targetHand.splice(idx, 1));
-  }
-
-  // Quitar carta(s) de Robo de la mano del atacante
-  const attackerHand = [...attacker.hand];
-  const roboIdx = attackerHand.findIndex(c => c.subtype === "robo");
-  attackerHand.splice(roboIdx, isCombo ? 2 : 1, ...stolen);
-
-  const updatedPlayers = room.players.map(p => {
-    if (p.id === playerId) return { ...p, hand: attackerHand };
-    if (p.id === targetId) return { ...p, hand: targetHand };
-    return p;
-  });
-
-  await updateDoc(roomRef, {
-    players: updatedPlayers,
-    discardPile: [...room.discardPile],
-    pendingReaction: null,
-    currentTurn: getNextPlayerId(room.players, playerId),
-  });
-}
-
-// Intercambio: roba 1 carta y da 1 (simple) o roba 2 y da 1 (combo)
-export async function playIntercambio(roomCode, playerId, targetId, giveCardId, isCombo = false) {
-  const roomRef = doc(db, "rooms", roomCode);
-  const roomSnap = await getDoc(roomRef);
-  const room = roomSnap.data();
-
-  if (room.currentTurn !== playerId) throw new Error("NO_ES_TU_TURNO");
-
-  const attacker = room.players.find(p => p.id === playerId);
-  const target = room.players.find(p => p.id === targetId);
-  const amount = isCombo ? 2 : 1;
-
   if (target.hand.length < amount) throw new Error("OBJETIVO_SIN_CARTAS");
 
   // Robar cartas al azar del objetivo
@@ -185,16 +146,48 @@ export async function playIntercambio(roomCode, playerId, targetId, giveCardId, 
     stolen.push(...targetHand.splice(idx, 1));
   }
 
-  // Quitar la carta que el atacante va a dar
-  const attackerHand = [...attacker.hand];
+  // Quitar carta(s) de Robo de la mano y mandarlas al descarte
+  const { newHand: attackerHand, usedCards } = extractSpecialCards(attacker.hand, "robo", isCombo ? 2 : 1);
+  attackerHand.push(...stolen);
+
+  const updatedPlayers = room.players.map(p => {
+    if (p.id === playerId) return { ...p, hand: attackerHand };
+    if (p.id === targetId) return { ...p, hand: targetHand };
+    return p;
+  });
+
+  await updateDoc(roomRef, {
+    players: updatedPlayers,
+    discardPile: [...room.discardPile, ...usedCards],
+    currentTurn: getNextPlayerId(room.players, playerId),
+  });
+}
+
+export async function playIntercambio(roomCode, playerId, targetId, giveCardId, isCombo = false) {
+  const roomRef = doc(db, "rooms", roomCode);
+  const roomSnap = await getDoc(roomRef);
+  const room = roomSnap.data();
+  if (room.currentTurn !== playerId) throw new Error("NO_ES_TU_TURNO");
+
+  const attacker = room.players.find(p => p.id === playerId);
+  const target = room.players.find(p => p.id === targetId);
+  const amount = isCombo ? 2 : 1;
+  if (target.hand.length < amount) throw new Error("OBJETIVO_SIN_CARTAS");
+
+  // Robar cartas al azar del objetivo
+  const targetHand = [...target.hand];
+  const stolen = [];
+  for (let i = 0; i < amount; i++) {
+    const idx = Math.floor(Math.random() * targetHand.length);
+    stolen.push(...targetHand.splice(idx, 1));
+  }
+
+  // Quitar carta a dar y cartas de Intercambio → descarte
+  let attackerHand = [...attacker.hand];
   const giveIdx = attackerHand.findIndex(c => c.id === giveCardId);
   const [given] = attackerHand.splice(giveIdx, 1);
-
-  // Quitar carta(s) de Intercambio de la mano del atacante
-  const intercambioIdx = attackerHand.findIndex(c => c.subtype === "intercambio");
-  attackerHand.splice(intercambioIdx, isCombo ? 2 : 1);
-
-  // Añadir cartas robadas al atacante y carta dada al objetivo
+  const { newHand, usedCards } = extractSpecialCards(attackerHand, "intercambio", isCombo ? 2 : 1);
+  attackerHand = newHand;
   attackerHand.push(...stolen);
   targetHand.push(given);
 
@@ -206,123 +199,70 @@ export async function playIntercambio(roomCode, playerId, targetId, giveCardId, 
 
   await updateDoc(roomRef, {
     players: updatedPlayers,
-    pendingReaction: null,
+    discardPile: [...room.discardPile, ...usedCards],
     currentTurn: getNextPlayerId(room.players, playerId),
   });
 }
 
-// Lanzar un ataque con reacción pendiente (para Rebote/Reflejo)
-export async function launchAttack(roomCode, playerId, targetId, attackCard, comboCard = null) {
-  const roomRef = doc(db, "rooms", roomCode);
-  await updateDoc(roomRef, {
-    pendingReaction: {
-      attackerId: playerId,
-      targetId,
-      card: attackCard,
-      comboCard,
-      isCombo: !!comboCard,
-      expiresAt: Date.now() + 10000, // 10 segundos para reaccionar
-    }
-  });
-}
-
-// Usar Rebote: desvía el ataque al jugador de la izquierda (simple) o a cualquiera (combo)
-export async function playRebote(roomCode, playerId, newTargetId = null) {
-  const roomRef = doc(db, "rooms", roomCode);
-  const roomSnap = await getDoc(roomRef);
-  const room = roomSnap.data();
-
-  const reaction = room.pendingReaction;
-  if (!reaction || reaction.targetId !== playerId) throw new Error("NO_HAY_ATAQUE");
-
-  // Simple: al jugador de la izquierda. Combo: al elegido
-  const target = newTargetId || getNextPlayerId(room.players, playerId);
-
-  await updateDoc(roomRef, {
-    pendingReaction: {
-      ...reaction,
-      targetId: target,
-      rebotedBy: playerId,
-    }
-  });
-}
-
-// Usar Reflejo: devuelve el ataque al atacante
-export async function playReflejo(roomCode, playerId) {
-  const roomRef = doc(db, "rooms", roomCode);
-  const roomSnap = await getDoc(roomRef);
-  const room = roomSnap.data();
-
-  const reaction = room.pendingReaction;
-  if (!reaction || reaction.targetId !== playerId) throw new Error("NO_HAY_ATAQUE");
-  if (reaction.rebotedBy) throw new Error("NO_SE_PUEDE_REFLEJAR_REBOTE");
-
-  // El ataque vuelve al atacante
-  await updateDoc(roomRef, {
-    pendingReaction: {
-      ...reaction,
-      targetId: reaction.attackerId,
-      reflectedBy: playerId,
-    }
-  });
-}
-
-// Usar Doble Descarte
 export async function playDobleDescarte(roomCode, playerId, cardIds, isCombo = false) {
   const roomRef = doc(db, "rooms", roomCode);
   const roomSnap = await getDoc(roomRef);
   const room = roomSnap.data();
-
   if (room.currentTurn !== playerId) throw new Error("NO_ES_TU_TURNO");
 
   const maxDiscard = isCombo ? 5 : 2;
   if (cardIds.length > maxDiscard) throw new Error("DEMASIADAS_CARTAS");
 
   const player = room.players.find(p => p.id === playerId);
-  const newHand = player.hand.filter(c => !cardIds.includes(c.id));
-  const discarded = player.hand.filter(c => cardIds.includes(c.id));
+
+  // Las cartas de Doble Descarte también van al descarte
+  const { newHand, usedCards } = extractSpecialCards(player.hand, "doble-descarte", isCombo ? 2 : 1);
+  const toDiscard = newHand.filter(c => cardIds.includes(c.id));
+  const remainingHand = newHand.filter(c => !cardIds.includes(c.id));
 
   const updatedPlayers = room.players.map(p =>
-    p.id === playerId ? { ...p, hand: newHand } : p
+    p.id === playerId ? { ...p, hand: remainingHand } : p
   );
 
   await updateDoc(roomRef, {
     players: updatedPlayers,
-    discardPile: [...room.discardPile, ...discarded],
+    discardPile: [...room.discardPile, ...usedCards, ...toDiscard],
     currentTurn: getNextPlayerId(room.players, playerId),
   });
 }
 
-// Usar Reinicio sobre un jugador
 export async function playReinicio(roomCode, playerId, targetId, isCombo = false) {
   const roomRef = doc(db, "rooms", roomCode);
   const roomSnap = await getDoc(roomRef);
   const room = roomSnap.data();
-
   if (room.currentTurn !== playerId) throw new Error("NO_ES_TU_TURNO");
 
+  const attacker = room.players.find(p => p.id === playerId);
   const target = room.players.find(p => p.id === targetId);
-  const discarded = [...target.hand];
 
-  let newHand = [];
+  // Quitar carta de Reinicio → descarte
+  const { newHand: attackerHand, usedCards } = extractSpecialCards(attacker.hand, "reinicio", isCombo ? 2 : 1);
+
+  const discarded = [...target.hand];
+  let newTargetHand = [];
   let newDeck = [...room.deck];
 
   if (!isCombo) {
-    // Simple: descarta todo y roba 5
     for (let i = 0; i < 5; i++) {
-      if (newDeck.length > 0) newHand.push(newDeck.pop());
+      if (newDeck.length > 0) newTargetHand.push(newDeck.pop());
     }
   }
-  // Combo: se queda con 0 cartas
 
-  const updatedPlayers = room.players.map(p =>
-    p.id === targetId ? { ...p, hand: newHand } : p
-  );
+  const updatedPlayers = room.players.map(p => {
+    if (p.id === playerId) return { ...p, hand: attackerHand };
+    if (p.id === targetId) return { ...p, hand: newTargetHand };
+    return p;
+  });
 
   await updateDoc(roomRef, {
     players: updatedPlayers,
     deck: newDeck,
-    discardPile: [...room.discardPile, ...discarded],
+    discardPile: [...room.discardPile, ...usedCards, ...discarded],
     currentTurn: getNextPlayerId(room.players, playerId),
   });
 }
